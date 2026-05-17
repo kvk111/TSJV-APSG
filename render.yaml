@@ -1,0 +1,29 @@
+# APSG Report — Render Deployment Configuration
+# Supports BOTH native Python (free tier) and Docker (paid tier)
+services:
+  - type: web
+    name: apsg-report
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh
+    healthCheckPath: /api/health
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: PORT
+        value: "10000"
+      - key: RENDER
+        value: "true"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
+      - key: PYTHONOPTIMIZE
+        value: "1"
+      # Set these in Render dashboard → Environment:
+      # SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
+      # ADMIN_EMAIL, NOTIFY_EMAIL
