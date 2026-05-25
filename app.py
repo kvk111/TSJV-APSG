@@ -8,6 +8,7 @@ import matplotlib
 matplotlib.use("Agg")   # set before any other matplotlib import — must be first
 import os, io, uuid, threading, time, json, copy, re, traceback, hashlib, logging
 import random
+import pytz
 import datetime as _dt
 import smtplib
 from email.mime.text import MIMEText
@@ -1349,8 +1350,14 @@ def daily_report_page():
 @app.route("/app/cga-report")
 @login_required
 def cga_report_page():
-    log_activity(session["username"],"OPEN_APP","CGA Report")
+    log_activity(session["username"],"OPEN_APP","Daily Report / Slack CGA Report")
     return render_template_string(CGA_REPORT_HTML)
+
+@app.route("/app/hourly-report")
+@login_required
+def hourly_report_page():
+    log_activity(session["username"],"OPEN_APP","Hourly Report")
+    return render_template_string(HOURLY_REPORT_HTML)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — CGA Report API
@@ -2023,8 +2030,6 @@ table.piv tr.grand td{background:var(--s2);color:var(--acc);font-weight:700;}
   <div class="mp-foot">
     <span class="mp-total-lbl">Grand Total &nbsp;<span class="mp-total-n" id="mpGrandTotal">—</span> loads</span>
     <div style="display:flex;align-items:center;gap:.4rem;">
-      <button class="mp-copy-btn" onclick="copySummary()" title="Copy summary to clipboard">📋 Copy Summary</button>
-      <span class="mp-copy-ok" id="copyOk">Copied Successfully</span>
       <button class="mp-close" onclick="document.getElementById('matPanel').style.display='none'">✕ hide</button>
     </div>
   </div>
@@ -2265,70 +2270,6 @@ function showMatPanel(j){
 }
 
 function escH(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-// ── Copy Summary ──────────────────────────────────────────────────────────────
-function copySummary(){
-  // Date range from current filter
-  var dateStr = _opDate || '';
-  var dateLabel = '';
-  if(dateStr){
-    try{
-      var d = new Date(dateStr);
-      var dd = String(d.getDate()).padStart(2,'0');
-      var mm = String(d.getMonth()+1).padStart(2,'0');
-      var yyyy = d.getFullYear();
-      // Op window: selected date 07:00 → next day 05:00
-      var nd = new Date(d); nd.setDate(nd.getDate()+1);
-      var ndd = String(nd.getDate()).padStart(2,'0');
-      var nmm = String(nd.getMonth()+1).padStart(2,'0');
-      var nyyyy = nd.getFullYear();
-      dateLabel = dd+'/'+mm+'/'+yyyy+' ~ '+ndd+'/'+nmm+'/'+nyyyy;
-    }catch(e){ dateLabel = dateStr; }
-  }
-
-  // Time range — always 7AM~5AM for this operational window
-  var timeRange = '(7AM ~ 5AM)';
-
-  // Totals: Softcline → HDB, Gutters → HDB GE, Total Loads → TOTAL
-  // Derive from panel stats
-  var totalEl = document.getElementById('mpTotal');
-  var softEl  = document.getElementById('mpSoft');
-  var geEl    = document.getElementById('mpGE');
-  var hdb  = parseInt((softEl  ? softEl.textContent.replace(/,/g,'') : '0') || '0');
-  var hdbge= parseInt((geEl    ? geEl.textContent.replace(/,/g,'') : '0')   || '0');
-  var total= parseInt((totalEl ? totalEl.textContent.replace(/,/g,'') : '0')|| '0');
-
-  var lines = [];
-  if(dateLabel) lines.push(dateLabel + ' ' + timeRange);
-  lines.push('HDB = ' + hdb);
-  lines.push('HDB GE = ' + hdbge);
-  lines.push('TOTAL = ' + total);
-
-  var text = lines.join('\n');
-
-  var okEl = document.getElementById('copyOk');
-  function _showCopied(){
-    if(okEl){ okEl.style.display='inline-block'; }
-    setTimeout(function(){ if(okEl) okEl.style.display='none'; }, 2000);
-  }
-
-  if(navigator.clipboard && navigator.clipboard.writeText){
-    navigator.clipboard.writeText(text).then(_showCopied).catch(function(){
-      _fallbackCopy(text); _showCopied();
-    });
-  } else {
-    _fallbackCopy(text); _showCopied();
-  }
-}
-
-function _fallbackCopy(text){
-  var ta = document.createElement('textarea');
-  ta.value = text;
-  ta.style.position = 'fixed'; ta.style.left = '-9999px';
-  document.body.appendChild(ta); ta.select();
-  try{ document.execCommand('copy'); }catch(e){}
-  document.body.removeChild(ta);
-}
 </script>
 <div style="position:fixed;bottom:0;left:0;right:0;z-index:9999;text-align:center;padding:.28rem 1rem;
   background:rgba(4,7,20,.72);backdrop-filter:blur(8px);border-top:1px solid rgba(255,255,255,.07);
@@ -2336,6 +2277,553 @@ function _fallbackCopy(text){
   pointer-events:none;user-select:none;">
   ✦ Internal Reporting Platform — APSG Staging Ground &nbsp;·&nbsp; Developed by Karthik
 </div>
+</body>
+</html>"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — Hourly Report (WB Operations Dashboard)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _hr_hour_label(h):
+    def fmt(x):
+        s = "AM" if x < 12 else "PM"
+        d = x % 12 or 12
+        return f"{d:02d} {s}"
+    return fmt(h) + " → " + fmt((h + 1) % 24)
+
+def _hr_fmt_short(h):
+    s = "AM" if h < 12 else "PM"
+    d = h % 12 or 12
+    return f"{d}{s}"
+
+def _hr_op_sort_key(h):
+    return h + 24 if h < 7 else h
+
+def _hr_load_and_process(f_bytes, fname):
+    import io
+    try:
+        if fname.lower().endswith((".xlsx", ".xls")):
+            raw = pd.read_excel(io.BytesIO(f_bytes), engine="openpyxl")
+        else:
+            try:
+                raw = pd.read_excel(io.BytesIO(f_bytes), engine="openpyxl")
+            except Exception:
+                raw = pd.read_csv(io.BytesIO(f_bytes), on_bad_lines="skip")
+    except Exception as e:
+        return None, {}, str(e)
+
+    raw.columns = [str(c).strip().upper() for c in raw.columns]
+    df = (raw[raw["ACCEPTED"].astype(str).str.strip().str.upper() == "YES"].copy()
+          if "ACCEPTED" in raw.columns else raw.copy())
+
+    for col in ["WB IN TIME", "WB OUT TIME"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+
+    if "MATERIAL" in df.columns:
+        df["MATERIAL"] = df["MATERIAL"].astype(str).str.strip().str.upper()
+
+    if "WB IN TIME" not in df.columns or df["WB IN TIME"].isna().all():
+        return None, {}, "No valid WB IN TIME column found."
+
+    valid_rows = df[df["WB IN TIME"].notna()]
+    rows_7am   = valid_rows[valid_rows["WB IN TIME"].dt.hour == 7]
+
+    if not rows_7am.empty:
+        first_7am  = rows_7am["WB IN TIME"].min()
+        op_start   = first_7am.normalize() + pd.Timedelta(hours=7)
+        op_end_cap = op_start + pd.Timedelta(hours=22)
+        df_op = df[
+            df["WB IN TIME"].notna() &
+            (df["WB IN TIME"] >= op_start) &
+            (df["WB IN TIME"] <  op_end_cap)
+        ].copy()
+    else:
+        df_op    = df[df["WB IN TIME"].notna()].copy()
+        op_start = df_op["WB IN TIME"].min()
+
+    if df_op.empty:
+        return None, {}, "No data found in the operational window (07:00 → next day 05:00)."
+
+    df_op["IN_HOUR"] = df_op["WB IN TIME"].dt.hour
+    if "WB OUT TIME" in df_op.columns:
+        df_op["OUT_HOUR"] = df_op["WB OUT TIME"].dt.hour
+
+    latest_wbin = df_op["WB IN TIME"].max()
+    last_vh     = int(latest_wbin.hour)
+    now_sgt     = datetime.now(pytz.timezone("Asia/Singapore"))
+    curr_h      = now_sgt.hour
+    hours_ahead = (curr_h - last_vh) % 24
+    latest_hour = last_vh  # always use last vehicle's hour as latest
+
+    start_date  = op_start.date()
+    end_date    = latest_wbin.date()
+    end_h_str   = _hr_fmt_short((latest_hour + 1) % 24)
+
+    if start_date == end_date:
+        date_range_copy = op_start.strftime("%d/%m/%Y") + " (7AM ~ " + end_h_str + ")"
+    else:
+        date_range_copy = (op_start.strftime("%d/%m/%Y") + " ~ " +
+                           latest_wbin.strftime("%d/%m/%Y") + " (7AM ~ " + end_h_str + ")")
+
+    meta = {
+        "op_start":        op_start.isoformat(),
+        "latest_wbin":     latest_wbin.isoformat(),
+        "latest_hour":     latest_hour,
+        "win_start_lbl":   op_start.strftime("%d %b %Y  %I:%M %p").upper(),
+        "win_end_lbl":     latest_wbin.strftime("%d %b %Y  %I:%M %p").upper(),
+        "report_date_lbl": latest_wbin.strftime("%d %b %Y"),
+        "date_range_copy": date_range_copy,
+    }
+    return df_op, meta, None
+
+def _hr_calc_queue_wait(df):
+    if "WB IN TIME" not in df.columns:
+        return 0, 0
+    has_in  = df["WB IN TIME"].notna()
+    has_out = df["WB OUT TIME"].notna() if "WB OUT TIME" in df.columns else pd.Series(False, index=df.index)
+    open_df = df[has_in & ~has_out]
+    queue   = int(len(open_df))
+    if queue == 0 or open_df["WB IN TIME"].isna().all():
+        return queue, 0
+    wait_min = max(0, int(
+        (df["WB IN TIME"].max() - open_df["WB IN TIME"].min()).total_seconds() // 60
+    ))
+    return queue, wait_min
+
+@app.route("/api/hourly/process", methods=["POST"])
+@login_required
+def hourly_process():
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "No file uploaded"}), 400
+    fname    = f.filename or ""
+    f_bytes  = f.read()
+    df, meta, err = _hr_load_and_process(f_bytes, fname)
+    if err:
+        return jsonify({"error": err}), 400
+    if df is None or df.empty:
+        return jsonify({"error": "No data found after applying operational window filter."}), 400
+
+    queue, wait_min = _hr_calc_queue_wait(df)
+
+    in_rows = df[df["WB IN TIME"].notna()].copy()
+    in_rows["_GE"] = (in_rows["MATERIAL"] == "GOOD EARTH").astype(int) if "MATERIAL" in in_rows.columns else 0
+    in_rows["_SC"] = (in_rows["MATERIAL"] == "SOFT CLAY").astype(int)  if "MATERIAL" in in_rows.columns else 0
+
+    grp_in = in_rows.groupby("IN_HOUR", as_index=False).agg(
+        total=("WB IN TIME", "count"), ge=("_GE", "sum"), sc=("_SC", "sum")
+    )
+    grp_in["_sk"] = grp_in["IN_HOUR"].apply(_hr_op_sort_key)
+    grp_in = grp_in.sort_values("_sk", ascending=False).drop(columns=["_sk"]).reset_index(drop=True)
+
+    if "WB OUT TIME" in df.columns and df["WB OUT TIME"].notna().any():
+        out_rows = df[df["WB OUT TIME"].notna()].copy()
+        grp_out  = (
+            out_rows.groupby("OUT_HOUR", as_index=False)
+            .agg(out_total=("WB OUT TIME", "count"))
+            .rename(columns={"OUT_HOUR": "IN_HOUR"})
+        )
+    else:
+        grp_out = pd.DataFrame(columns=["IN_HOUR", "out_total"])
+
+    merged = grp_in.merge(grp_out, on="IN_HOUR", how="left")
+    merged["out_total"] = merged["out_total"].fillna(0).astype(int)
+
+    latest_hour = int(merged.iloc[0]["IN_HOUR"])
+    latest_out  = int(merged.iloc[0]["out_total"])
+    sc_total    = int(in_rows["_SC"].sum())
+    ge_total    = int(in_rows["_GE"].sum())
+    truck_total = int(len(in_rows))
+
+    cards = []
+    for _, row in merged.iterrows():
+        h   = int(row["IN_HOUR"])
+        sc  = int(row["sc"])
+        ge  = int(row["ge"])
+        tot = int(row["total"])
+        out = int(row["out_total"])
+        cards.append({
+            "hour":      h,
+            "label":     _hr_hour_label(h),
+            "sc":        sc,
+            "ge":        ge,
+            "total":     tot,
+            "out_total": out,
+            "is_latest": h == latest_hour,
+        })
+
+    summary_copy = (
+        meta["date_range_copy"] + "\n"
+        "HDB = " + str(sc_total) + "\n"
+        "HDB GE = " + str(ge_total) + "\n"
+        "TOTAL = " + str(truck_total)
+    )
+    card_copy = (
+        "Date/Period of reporting: " + meta["report_date_lbl"] + "\n"
+        + _hr_fmt_short(latest_hour) + " ~" + _hr_fmt_short((latest_hour + 1) % 24) + "\n"
+        "Waiting time: " + str(wait_min) + " min\n"
+        "Queue: " + str(queue) + " Trucks\n"
+        "Exit: " + str(latest_out) + " Trucks"
+    )
+
+    log_activity(session["username"], "HOURLY_PROCESS", fname)
+    return jsonify({
+        "ok":           True,
+        "meta":         meta,
+        "sc_total":     sc_total,
+        "ge_total":     ge_total,
+        "truck_total":  truck_total,
+        "queue":        queue,
+        "wait_min":     wait_min,
+        "cards":        cards,
+        "summary_copy": summary_copy,
+        "card_copy":    card_copy,
+    })
+
+
+# ── Hourly Report HTML ─────────────────────────────────────────────────────────
+HOURLY_REPORT_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hourly Report — APSG</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Poppins:wght@700;800&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+:root{--bg:#0A0F1E;--s1:#111827;--s2:#1C2333;--s3:#232D42;
+  --bdr:rgba(255,255,255,.08);--t1:#F1F5F9;--t2:#94A3B8;--mu:#64748B;
+  --acc:#818CF8;--acc2:#6366F1;--acc-l:#A5B4FC;--grn:#10B981;--r:14px;}
+html,body{background:url('/static/bg.jpg') center/cover fixed #08101E;}
+body::before{content:'';position:fixed;inset:0;z-index:0;background:rgba(3,7,18,.52);pointer-events:none;}
+body{font-family:'Inter',sans-serif;color:var(--t1);min-height:100vh;padding-bottom:4rem;}
+body>*{position:relative;z-index:1;}
+
+/* topbar */
+.topbar{position:sticky;top:0;z-index:200;height:44px;display:flex;align-items:center;
+  padding:0 1.2rem;gap:.65rem;background:rgba(6,10,28,.65);backdrop-filter:blur(18px);
+  border-bottom:1px solid var(--bdr);}
+.topbar .brand{font-family:'Poppins',sans-serif;font-size:.8rem;font-weight:800;color:var(--acc-l);}
+.topbar .sep{width:1px;height:18px;background:var(--bdr);}
+.topbar .lbl{font-size:.76rem;font-weight:600;color:var(--t2);}
+.topbar .sp{flex:1;}
+.back{background:rgba(99,102,241,.18);border:1px solid rgba(99,102,241,.35);border-radius:7px;
+  padding:.28rem .8rem;font-size:.7rem;font-weight:600;color:#C5D5FF;text-decoration:none;transition:.2s;}
+.back:hover{background:rgba(99,102,241,.32);}
+
+/* layout */
+.wrap{max-width:860px;margin:0 auto;padding:1.4rem 1rem 4rem;}
+.panel{background:rgba(8,14,38,.75);border:1px solid var(--bdr);border-radius:var(--r);
+  padding:1.4rem;margin-bottom:1.1rem;backdrop-filter:blur(14px);}
+.ptitle{font-size:.7rem;font-weight:700;color:var(--acc);text-transform:uppercase;
+  letter-spacing:.1em;margin-bottom:.85rem;}
+
+/* upload zone */
+.dz{border:2px dashed rgba(129,140,248,.35);border-radius:11px;padding:1.6rem 1rem;
+  text-align:center;cursor:pointer;transition:.22s;position:relative;
+  background:rgba(129,140,248,.03);user-select:none;}
+.dz:hover,.dz.over{border-color:var(--acc);background:rgba(129,140,248,.09);}
+.dz.has{border-color:var(--acc);border-style:solid;background:rgba(129,140,248,.06);}
+.dz .ico{font-size:2rem;display:block;margin-bottom:.3rem;}
+.dz .hint{font-size:.72rem;color:var(--mu);margin-top:.25rem;}
+.dz .fn{font-size:.78rem;color:var(--acc);font-weight:700;margin-top:.35rem;}
+
+/* generate btn */
+.btn-gen{width:100%;padding:.9rem;background:linear-gradient(135deg,#6366F1,#818CF8);
+  border:none;border-radius:10px;color:#fff;font-size:1rem;font-weight:800;
+  cursor:pointer;transition:.2s;margin-top:.65rem;}
+.btn-gen:hover{opacity:.9;transform:translateY(-1px);}
+.btn-gen:disabled{opacity:.38;cursor:not-allowed;transform:none;}
+
+/* error */
+.err{background:rgba(239,68,68,.09);border:1px solid rgba(239,68,68,.3);border-radius:8px;
+  padding:.65rem 1rem;color:#FCA5A5;font-size:.82rem;display:none;margin-top:.55rem;}
+
+/* spinner */
+.loading{display:none;text-align:center;padding:2rem;color:var(--t2);}
+.spin{width:34px;height:34px;border:3px solid rgba(129,140,248,.2);border-top-color:var(--acc);
+  border-radius:50%;animation:sp .7s linear infinite;margin:0 auto .7rem;}
+@keyframes sp{to{transform:rotate(360deg);}}
+
+/* summary bar */
+.sum-bar{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:.75rem;align-items:center;
+  margin-bottom:1rem;}
+@media(max-width:560px){.sum-bar{grid-template-columns:1fr 1fr;}}
+.sum-box{background:rgba(8,14,38,.88);border:1.5px solid rgba(129,140,248,.28);border-radius:12px;
+  padding:.9rem 1.1rem;text-align:center;box-shadow:0 4px 18px rgba(0,0,0,.35);}
+.sum-v{font-family:'JetBrains Mono',monospace;font-size:1.8rem;font-weight:800;color:#D0E0FF;line-height:1;text-shadow:0 0 18px rgba(129,140,248,.5);}
+.sum-l{font-size:.74rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
+  color:#A5B4FC;margin-top:.3rem;}
+.copy-sum-btn{padding:.72rem 1.4rem;border:1.5px solid rgba(129,140,248,.65);border-radius:9px;
+  background:linear-gradient(135deg,rgba(99,102,241,.32),rgba(129,140,248,.2));color:#D0E0FF;font-size:.8rem;font-weight:800;
+  cursor:pointer;transition:.2s;white-space:nowrap;letter-spacing:.06em;box-shadow:0 3px 14px rgba(99,102,241,.3);}
+.copy-sum-btn:hover{background:linear-gradient(135deg,rgba(99,102,241,.5),rgba(129,140,248,.35));border-color:rgba(165,180,252,.9);box-shadow:0 5px 20px rgba(99,102,241,.45);transform:translateY(-1px);}
+.copy-sum-btn.done{background:rgba(16,185,129,.18);border-color:rgba(16,185,129,.4);color:#4ADE80;}
+
+/* op window bar */
+.opbar{display:flex;align-items:center;gap:.7rem;padding:.55rem 1rem;
+  background:rgba(8,14,38,.65);border:1px solid var(--bdr);border-radius:9px;
+  margin-bottom:1rem;font-size:.72rem;flex-wrap:wrap;}
+.opbar-lbl{font-weight:800;color:#94A3B8;text-transform:uppercase;letter-spacing:.09em;font-size:.74rem;}
+.opbar-val{font-family:'JetBrains Mono',monospace;font-weight:700;color:#E2ECFF;font-size:.78rem;}
+.opbar-sep{color:var(--mu);}
+
+/* hourly cards */
+.cards-wrap{display:none;}
+.sec-lbl{font-size:.74rem;font-weight:800;letter-spacing:.13em;text-transform:uppercase;
+  color:#A5B4FC;margin-bottom:.7rem;text-shadow:0 0 10px rgba(129,140,248,.3);}
+.hscroll{display:flex;gap:8px;overflow-x:auto;padding-bottom:6px;
+  scrollbar-width:thin;scrollbar-color:rgba(129,140,248,.3) transparent;}
+.hscroll::-webkit-scrollbar{height:4px;}
+.hscroll::-webkit-scrollbar-thumb{background:rgba(129,140,248,.3);border-radius:2px;}
+
+/* latest card (highlighted) */
+.cl{flex:0 0 auto;width:182px;background:rgba(10,17,44,.9);
+  border:2px solid var(--acc);border-radius:11px;padding:.75rem .9rem;position:relative;
+  box-shadow:0 0 20px rgba(99,102,241,.18);}
+/* normal cards */
+.co{flex:0 0 auto;width:152px;background:rgba(8,14,38,.75);
+  border:1px solid var(--bdr);border-radius:11px;padding:.75rem .9rem;transition:border-color .15s;}
+.co:hover{border-color:rgba(129,140,248,.35);}
+.latest-tag{position:absolute;top:7px;right:8px;font-size:.52rem;font-weight:700;
+  letter-spacing:.1em;color:var(--acc-l);text-transform:uppercase;
+  background:rgba(99,102,241,.2);border:1px solid rgba(129,140,248,.3);
+  border-radius:4px;padding:.05rem .32rem;}
+.ch{font-family:'JetBrains Mono',monospace;font-size:.78rem;font-weight:700;color:var(--t1);
+  padding-bottom:.4rem;margin-bottom:.4rem;border-bottom:1px solid var(--bdr);white-space:nowrap;}
+.cr{display:flex;justify-content:space-between;align-items:center;padding:2.5px 0;}
+.cr-l{font-size:.68rem;font-weight:800;color:#94A3B8;letter-spacing:.07em;text-transform:uppercase;}
+.cr-v{font-family:'JetBrains Mono',monospace;font-size:1.02rem;font-weight:700;color:#E8F0FF;}
+.cdiv{border:none;border-top:1px solid var(--bdr);margin:.4rem 0;}
+/* copy button inside latest card */
+.card-copy-btn{display:flex;align-items:center;justify-content:center;gap:5px;
+  margin-top:.6rem;padding:.45rem .7rem;
+  background:linear-gradient(135deg,rgba(99,102,241,.28),rgba(129,140,248,.18));border:1.5px solid rgba(129,140,248,.55);border-radius:7px;
+  cursor:pointer;width:100%;font-size:.68rem;font-weight:800;letter-spacing:.07em;
+  text-transform:uppercase;color:#C7D9FF;transition:.2s;box-shadow:0 2px 10px rgba(99,102,241,.22);}
+.card-copy-btn:hover{background:linear-gradient(135deg,rgba(99,102,241,.45),rgba(129,140,248,.32));border-color:rgba(165,180,252,.8);box-shadow:0 4px 14px rgba(99,102,241,.38);transform:translateY(-1px);}
+.card-copy-btn.done{background:rgba(16,185,129,.18);border-color:rgba(16,185,129,.4);color:#4ADE80;}
+
+/* footer bar */
+.footer-bar{position:fixed;bottom:0;left:0;right:0;z-index:9999;text-align:center;
+  padding:.28rem 1rem;background:rgba(4,7,20,.72);backdrop-filter:blur(8px);
+  border-top:1px solid rgba(255,255,255,.07);font-size:11px;font-weight:600;
+  color:rgba(200,220,255,.7);letter-spacing:.06em;pointer-events:none;user-select:none;}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="brand">APSG</span>
+  <div class="sep"></div>
+  <span class="lbl">⏱ Hourly Report</span>
+  <div class="sp"></div>
+  <span style="font-size:.65rem;color:var(--acc-l);font-weight:700;margin-right:.35rem;">✦ Karthi</span>
+  <a href="/" class="back">← Dashboard</a>
+</div>
+
+<div class="wrap">
+
+  <!-- Upload Panel -->
+  <div class="panel">
+    <div class="ptitle">📁 Upload WB Data File</div>
+    <div style="background:rgba(129,140,248,.07);border-left:3px solid var(--acc);
+      border-radius:8px;padding:.65rem 1rem;font-size:.77rem;color:var(--t2);margin-bottom:.9rem;">
+      Op window: <strong>First 07:00 in data → +22 hrs</strong> &nbsp;|&nbsp;
+      Only <strong>Accepted</strong> records counted &nbsp;|&nbsp;
+      Columns: <strong>WB IN TIME · MATERIAL</strong>
+    </div>
+    <div class="dz" id="dz">
+      <input type="file" id="fi" accept=".xlsx,.xls,.csv" style="display:none">
+      <span class="ico">📄</span>
+      <strong style="font-size:.84rem;">Click to browse or drag &amp; drop</strong>
+      <div class="hint">.xlsx · .xls · .csv</div>
+      <div class="fn" id="fn"></div>
+    </div>
+    <button class="btn-gen" id="btnGen" onclick="generate()" disabled>⚡ Generate Hourly Report</button>
+    <div class="err" id="errBox"></div>
+  </div>
+
+  <!-- Spinner -->
+  <div class="loading" id="loadDiv">
+    <div class="spin"></div>
+    Processing weighbridge data…
+  </div>
+
+  <!-- Results -->
+  <div id="resultsDiv" style="display:none;">
+
+    <!-- Summary bar -->
+    <div class="sum-bar" id="sumBar">
+      <div class="sum-box">
+        <div class="sum-v" id="scTot">—</div>
+        <div class="sum-l">SC Total (HDB)</div>
+      </div>
+      <div class="sum-box">
+        <div class="sum-v" id="geTot">—</div>
+        <div class="sum-l">GE Total</div>
+      </div>
+      <div class="sum-box">
+        <div class="sum-v" id="trTot">—</div>
+        <div class="sum-l">Truck Total</div>
+      </div>
+      <div>
+        <button class="copy-sum-btn" id="sumCopyBtn" onclick="copySummary()">⎘ &nbsp;COPY</button>
+      </div>
+    </div>
+
+    <!-- Op window bar -->
+    <div class="opbar">
+      <span class="opbar-lbl">Op Window</span>
+      <span class="opbar-val" id="opWin">—</span>
+    </div>
+
+    <!-- Cards -->
+    <div class="cards-wrap" id="cardsWrap">
+      <div class="sec-lbl">Hourly Summary — Latest First</div>
+      <div class="hscroll" id="hscroll"></div>
+    </div>
+
+  </div>
+
+</div><!-- /wrap -->
+
+<div class="footer-bar">
+  ✦ Internal Reporting Platform — APSG Staging Ground &nbsp;·&nbsp; Developed by Karthik
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+var _file=null, _summCopy='', _cardCopy='';
+
+// ── Drop zone ─────────────────────────────────────────────────────────────────
+var dz=document.getElementById('dz');
+var fi=document.getElementById('fi');
+dz.addEventListener('click',function(){ fi.click(); });
+fi.addEventListener('change',function(){ if(fi.files[0]) applyFile(fi.files[0]); });
+dz.addEventListener('dragenter',function(e){ e.preventDefault(); e.stopPropagation(); dz.classList.add('over'); });
+dz.addEventListener('dragover', function(e){ e.preventDefault(); e.stopPropagation(); dz.classList.add('over'); });
+dz.addEventListener('dragleave',function(e){
+  e.stopPropagation();
+  if(!dz.contains(e.relatedTarget)) dz.classList.remove('over');
+});
+dz.addEventListener('drop',function(e){
+  e.preventDefault(); e.stopPropagation(); dz.classList.remove('over');
+  var f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0];
+  if(f) applyFile(f);
+});
+
+function applyFile(f){
+  _file=f;
+  document.getElementById('fn').textContent='✓ '+f.name;
+  dz.classList.add('has');
+  document.getElementById('btnGen').disabled=false;
+}
+
+function showErr(m){ var b=document.getElementById('errBox'); b.textContent='❌ '+m; b.style.display='block'; }
+function clearErr(){ document.getElementById('errBox').style.display='none'; }
+
+// ── Generate ──────────────────────────────────────────────────────────────────
+async function generate(){
+  clearErr();
+  document.getElementById('resultsDiv').style.display='none';
+  document.getElementById('cardsWrap').style.display='none';
+  document.getElementById('loadDiv').style.display='block';
+  document.getElementById('btnGen').disabled=true;
+
+  var fd=new FormData();
+  fd.append('file',_file);
+
+  try{
+    var r=await fetch('/api/hourly/process',{method:'POST',body:fd});
+    var j=await r.json();
+    document.getElementById('loadDiv').style.display='none';
+    document.getElementById('btnGen').disabled=false;
+    if(!r.ok||j.error){ showErr(j.error||'Server error'); return; }
+
+    _summCopy = j.summary_copy||'';
+    _cardCopy = j.card_copy||'';
+
+    document.getElementById('scTot').textContent = (j.sc_total||0).toLocaleString();
+    document.getElementById('geTot').textContent = (j.ge_total||0).toLocaleString();
+    document.getElementById('trTot').textContent = (j.truck_total||0).toLocaleString();
+
+    var m=j.meta||{};
+    var opWin = (m.win_start_lbl||'') + ' → ' + (m.win_end_lbl||'');
+    document.getElementById('opWin').textContent = opWin;
+
+    buildCards(j.cards||[], j.queue||0, j.wait_min||0, j.card_copy||'');
+
+    document.getElementById('resultsDiv').style.display='block';
+    document.getElementById('cardsWrap').style.display='block';
+
+  }catch(ex){
+    document.getElementById('loadDiv').style.display='none';
+    document.getElementById('btnGen').disabled=false;
+    showErr('Network error: '+ex.message);
+  }
+}
+
+function buildCards(cards, queue, wait_min, cardCopy){
+  var scr=document.getElementById('hscroll');
+  scr.innerHTML='';
+  cards.forEach(function(c){
+    var div=document.createElement('div');
+    if(c.is_latest){
+      div.className='cl';
+      div.innerHTML=
+        '<span class="latest-tag">LATEST</span>'+
+        '<div class="ch">'+escH(c.label)+'</div>'+
+        '<div class="cr"><span class="cr-l">SC</span><span class="cr-v">'+c.sc+'</span></div>'+
+        '<div class="cr"><span class="cr-l">GE</span><span class="cr-v">'+c.ge+'</span></div>'+
+        '<div class="cr"><span class="cr-l">TOTAL</span><span class="cr-v">'+c.total+'</span></div>'+
+        '<div class="cr"><span class="cr-l">OUT</span><span class="cr-v">'+c.out_total+'</span></div>'+
+        '<hr class="cdiv">'+
+        '<div class="cr"><span class="cr-l">QUEUE</span><span class="cr-v">'+queue+'</span></div>'+
+        '<div class="cr"><span class="cr-l">WAIT</span><span class="cr-v">'+wait_min+'m</span></div>'+
+        '<hr class="cdiv">'+
+        '<button class="card-copy-btn" id="ccb" onclick="copyCard()">⎘ &nbsp;COPY SUMMARY</button>';
+    } else {
+      div.className='co';
+      div.innerHTML=
+        '<div class="ch">'+escH(c.label)+'</div>'+
+        '<div class="cr"><span class="cr-l">SC</span><span class="cr-v">'+c.sc+'</span></div>'+
+        '<div class="cr"><span class="cr-l">GE</span><span class="cr-v">'+c.ge+'</span></div>'+
+        '<div class="cr"><span class="cr-l">TOTAL</span><span class="cr-v">'+c.total+'</span></div>'+
+        '<div class="cr"><span class="cr-l">OUT</span><span class="cr-v">'+c.out_total+'</span></div>';
+    }
+    scr.appendChild(div);
+  });
+}
+
+function copySummary(){
+  doCopy(_summCopy, 'sumCopyBtn', '⎘ &nbsp;COPY');
+}
+function copyCard(){
+  doCopy(_cardCopy, 'ccb', '⎘ &nbsp;COPY SUMMARY');
+}
+
+function doCopy(text, btnId, resetLabel){
+  var btn=document.getElementById(btnId);
+  function onOk(){
+    btn.innerHTML='✓ &nbsp;COPIED';
+    btn.classList.add('done');
+    setTimeout(function(){ btn.innerHTML=resetLabel; btn.classList.remove('done'); }, 2200);
+  }
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(onOk).catch(function(){ fallbackCopy(text,onOk); });
+  } else { fallbackCopy(text,onOk); }
+}
+function fallbackCopy(text,cb){
+  var ta=document.createElement('textarea'); ta.value=text;
+  ta.style.cssText='position:fixed;top:0;left:0;opacity:0;';
+  document.body.appendChild(ta); ta.focus(); ta.select();
+  try{ document.execCommand('copy'); cb(); }catch(e){}
+  document.body.removeChild(ta);
+}
+function escH(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+</script>
 </body>
 </html>"""
 
@@ -5539,6 +6027,7 @@ body{font-family:"Inter",system-ui,sans-serif;min-height:100vh;
 .card-amber{--accent:#FBBF24;--accent-border:rgba(251,191,36,.22);}
 .card-gray{--accent:#6B7280;--accent-border:rgba(107,114,128,.15);}
 .card-teal{--accent:#2DD4BF;--accent-border:rgba(45,212,191,.22);}
+.card-indigo{--accent:#818CF8;--accent-border:rgba(129,140,248,.22);}
 
 .app-card.disabled{cursor:not-allowed;opacity:.35;pointer-events:none;}
 
@@ -5808,17 +6297,27 @@ h4 { font-size: 17px !important; }
       <span class="card-badge badge-active">&#10003; Active</span>
     </a>
 
-    <a href="/app/excel-rejection" class="app-card card-green" style="--delay:.10s">
+    <a href="/app/hourly-report" class="app-card card-indigo" style="--delay:.10s">
       <div class="card-icon-wrap">
-        <div class="card-icon">&#128203;</div>
+        <div class="card-icon">&#9201;</div>
         <span class="card-arrow">&#8594;</span>
       </div>
-      <div class="card-title">Excel Rejection Report</div>
-      <div class="card-desc">Convert Excel data into formatted PowerPoint rejection reports grouped by source site.</div>
+      <div class="card-title">Hourly Report</div>
+      <div class="card-desc">Upload WB data to view hourly SC / GE breakdown, queue status, wait time, and copy-ready Slack summaries.</div>
       <span class="card-badge badge-active">&#10003; Active</span>
     </a>
 
-    <a href="/ct/" class="app-card card-gray" style="--delay:.15s">
+    <a href="/app/cga-report" class="app-card card-teal" style="--delay:.15s">
+      <div class="card-icon-wrap">
+        <div class="card-icon">&#128666;</div>
+        <span class="card-arrow">&#8594;</span>
+      </div>
+      <div class="card-title">CGA Report</div>
+      <div class="card-desc">Generate hourly trucks pivot table for CGA site codes. Upload source Excel/CSV, select date, download as PNG image.</div>
+      <span class="card-badge badge-active">&#10003; Active</span>
+    </a>
+
+    <a href="/ct/" class="app-card card-gray" style="--delay:.20s">
       <div class="card-icon-wrap">
         <div class="card-icon">⏱</div>
         <span class="card-arrow">&#8594;</span>
@@ -5828,7 +6327,17 @@ h4 { font-size: 17px !important; }
       <span class="card-badge badge-active">&#10003; Active</span>
     </a>
 
-    <a href="/app/photo-merge" class="app-card card-purple" style="--delay:.20s">
+    <a href="/app/excel-rejection" class="app-card card-green" style="--delay:.25s">
+      <div class="card-icon-wrap">
+        <div class="card-icon">&#128203;</div>
+        <span class="card-arrow">&#8594;</span>
+      </div>
+      <div class="card-title">Excel Rejection Report</div>
+      <div class="card-desc">Convert Excel data into formatted PowerPoint rejection reports grouped by source site.</div>
+      <span class="card-badge badge-active">&#10003; Active</span>
+    </a>
+
+    <a href="/app/photo-merge" class="app-card card-purple" style="--delay:.30s">
       <div class="card-icon-wrap">
         <div class="card-icon">&#128444;</div>
         <span class="card-arrow">&#8594;</span>
@@ -5838,23 +6347,13 @@ h4 { font-size: 17px !important; }
       <span class="card-badge badge-active">&#10003; Active</span>
     </a>
 
-    <a href="/app/ppt-rejection" class="app-card card-amber" style="--delay:.25s">
+    <a href="/app/ppt-rejection" class="app-card card-amber" style="--delay:.35s">
       <div class="card-icon-wrap">
         <div class="card-icon">&#128193;</div>
         <span class="card-arrow">&#8594;</span>
       </div>
       <div class="card-title">Monthly Rejection Report Filter</div>
       <div class="card-desc">Upload bulk PPT files, filter by E-Token/date/reason, and generate grouped rejection reports with ZIP export.</div>
-      <span class="card-badge badge-active">&#10003; Active</span>
-    </a>
-
-    <a href="/app/cga-report" class="app-card card-teal" style="--delay:.30s">
-      <div class="card-icon-wrap">
-        <div class="card-icon">&#128666;</div>
-        <span class="card-arrow">&#8594;</span>
-      </div>
-      <div class="card-title">CGA Report</div>
-      <div class="card-desc">Generate hourly trucks pivot table for CGA site codes. Upload source Excel/CSV, select date, download as PNG image.</div>
       <span class="card-badge badge-active">&#10003; Active</span>
     </a>
 
